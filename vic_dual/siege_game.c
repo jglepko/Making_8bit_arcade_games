@@ -94,7 +94,7 @@ inline void set8910(byte reg, byte data) {
 }
 
 ////////
-
+// https://en.wikipedia.org/wiki/Linear-feedback_shift_register
 static word lfsr = 1;
 word rand() {
   byte lsb = lsfr & 1;  // Get LSB (i.e. the output bit)
