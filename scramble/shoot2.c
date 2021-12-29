@@ -241,6 +241,325 @@ byte enemies_left;
 word player_score;
 word framecount;
 
+void add_score(word bcd) {
+  player_score = bcd_add(player_score, bcd);
+  draw_bcd_word(0, 1, player_score);
+  putchar(4, 1, CHAR('0'));
+}
+
+void setup_formation() {
+  byte i;
+  memset(formation, 0, sizeof(formation));
+  memset(attackers, 0, sizeof(attackers));
+  memset(missiles, 0, sizeof(missiles));
+  for (i=0; i<MAX_IN_FORMATION; ++i) {
+    byte flagship = i < ENEMIES_PER_ROW;
+    formation[i].shape = flagship ? 0x43 : 0x43;
+  }
+  enemies_left = MAX_IN_FORMATION;
+}
+
+void draw_row(byte row) {
+  byte i;
+  byte y = 4 + row * 2;
+  vcolumns[y].attrib = 0x2;
+  vcolumns[y].scroll = formation_offset_x;
+  for (i=0; i<ENEMIES_PER_ROW; ++i) {
+    byte x = i * 3;
+    byte shape = formation[i + row*ENEMIES_PER_ROW].shape;
+    if (shape) {
+      putchar(x, y, shape);
+      putchar(x+1, y, shape-2);
+    } else {
+      putchar(x, y, BLANK);
+      putchar(x+1, y, BLANK);
+    }
+  }
+}
+
+void draw_next_row() {
+  draw_row(current_row);
+  if (++current_row == ENEMY_ROWS) {
+    current_row = 0;
+    formation_offset_x += formation_direction;
+    if (formation_offset_x == 40) {
+      formation_direction = -1;
+    }
+    else if (formation_offset_x == 0) {
+      formation_direction = 1;
+    }
+  }
+}
+      
+#define FLIPX 0x40
+#define FLIPY 0x80
+#define FLIPXY 0xc0
+
+const byte DIR_TO_CODE[32] = {
+  0, 1, 2, 3, 4, 5, 6, 6,
+  6|FLIPXY, 6|FLIPXY, 5|FLIPXY, 4|FLIPXY, 3|FLIPXY, 2|FLIPXY, 1|FLIPXY, 0|FLIPXY,
+  0|FLIPX, 1|FLIPX, 2|FLIPX, 3|FLIPX, 4|FLIPX, 5|FLIPX, 6|FLIPX, 6|FLIPX,
+  6|FLIPX, 6|FLIPX, 5|FLIPX, 4|FLIPX, 3|FLIPX, 2|FLIPX, 1|FLIPX, 0|FLIPX,
+};
+
+const byte SINTBL[32] = {
+  0, 25, 49, 71, 90, 106, 117, 125,
+  127, 125, 117, 106, 90, 71, 49, 25,
+  0, -25, -49, -71, -90, -106, -117, -125,
+  -127, -125, -117, -106, -90, -71, -49, -25,
+};
+
+signed char isin(byte dir) {
+  return SINTBL[dir & 31];
+}
+
+signed char icos(byte dir) {
+  return isin(dir+8);
+}
+
+#define FORMATION_X0 18
+#define FORMATION_Y0 27
+#define FORMATION_XSPACE 24
+#define FORMATION_YSPACE 16
+
+byte get_attacker_x(byte formation_index) {
+  byte column = (formation_index % ENEMIES_PER_ROW);
+  return FORMATION_XSPACE*column + FORMATION_X0 + formation_offset_x;
+}
+
+byte get_attacker_y(byte formation_index) {
+  byte row = formation_index / ENEMIES_PER_ROW;
+  return FORMATION_YSPACE*row + FORMATION_Y0;
+}
+
+void draw_attacker(byte i) {
+  AttackingEnemy* a = &attackers[i];
+  if (a->findex) {
+    byte code = DIR_TO_CODE[a->dir & 31];
+    vsprites[i].code  = code + a->shape + 14;
+    vsprites[i].xpos  = a->x >> 8;
+    vsprites[i].ypos  = a->y >> 8;
+    vsprites[i].color  = 2;
+  } else {
+    vsprites[i].ypos  = 255; // offscreen
+  }
+}
+    
+void draw_attackers() {
+  byte i;
+  for (i=0; i<MAX_ATTACKERS; ++i) {
+    draw_attacker(i);
+  }
+} 
+
+void return_attacker(AttackingEnemy* a) {
+  byte fi = a->findex-1;
+  byte destx = get_attacker_x(fi);
+  byte desty = get_attacker_y(fi);
+  byte ydist = desty - (a->y >> 8);
+  // are we close to our formation slot?
+  if (ydist == 0) {
+    // convert back to formation enemy
+    formation[fi].shape = a->shape;
+    a->findex = 0;
+  } else {
+    a->dir = (ydist + 16) & 31;
+    a->x = destx << 8;
+    a->y += 128;
+  }
+}
+
+void fly_attacker(AttackingEnemy* a) {
+  a->x += isin(a->dir) * 2;
+  a->y += icos(a->dir) * 2;
+  if ((a->y >> 8) == 0) {
+    a->returning = 1;
+  }
+}
+
+void move_attackers() {
+  byte i;
+  for (i=0; i<MAX_ATTACKERS; ++i) {
+    AttackingEnemy* a = &attackers[i];
+    if (a->findex) {
+      if (a->returning)
+        return_attacker(a);
+      else 
+	fly_attacker(a);
+    }
+  }
+}  
+  
+void think_attackers() {
+  byte i;
+  for (i=0; i<MAX_ATTACKERS; ++i) {
+    AttackingEnemy* a = &attackers[i];
+    if (a->findex) {
+      // rotate?
+      byte x = a->x >> 8;  
+      byte y = a->y >> 8;  
+      // don't shoot missiles after player exploded
+      if (y < 128 || player_exploding) {
+        if (x < 112) {
+          a->dir++;
+	} else {
+	  a->dir--;
+	}
+      } else {
+        // lower half of screen
+        // shoot a missile?
+        if (missiles[i].ypos == 0) {
+          missiles[i].ypos = 245-y; 
+          missiles[i].xpos = x+8; 
+          missiles[i].dy = -2;
+        }
+      }
+    }
+  }
+}     
+
+void formation_to_attacker(byte formation_index) {
+  byte i;
+  // out of bounds? return
+  if (formation_index >= MAX_IN_FORMATION) 
+    return;
+  // nobody in formation? return
+  if (!formation[formation_index].shape)
+    return;
+  // find an empty attacker slot
+  for (i=0; i<MAX_ATTACKERS; ++i) {
+    AttackingEnemy* a = &attackers[i];
+    if (a->findex == 0) {
+      a->x = get_attacker_x(formation_index) << 8;
+      a->y = get_attacker_y(formation_index) << 8;
+      a->shape = formation[formation_index].shape;
+      a->findex = formation_index+1;
+      a->dir = 0;
+      a->returning = 0;
+      formation[formation_index].shape = 0;
+      break;
+    }
+  }
+}
+
+void draw_player() {
+  vcolumns[29].attrib = 1;
+  vcolumns[30].attrib = 1;
+  vram[30][29] = 0x60;
+  vram[31][29] = 0x62;
+  vram[30][30] = 0x61;
+  vram[31][30] = 0x63;
+}
+
+void move_player() {
+  if (LEFT1 && player_x > 16) player_x--;
+  if (RIGHT1 && player_x < 224) player_x++;
+  if (FIRE1 && missiles[7].ypos == 0) {
+    missiles[7].ypos = 252-player_y; // must be multiple of missile speed
+    missiles[7].xpos = player_x+8; // player X position
+    missiles[7].dy = 4; // player missile speed
+  }
+  vcolumns[29].scroll = player_x;
+  vcolumns[30].scroll = player_x;
+}
+    
+void move_missiles() {
+  byte i;
+  for (i=0; i<8; ++i) {
+    if (missiles[i].ypos) {
+      // hit the bottom or top?
+      if ((byte)(missiles[i].ypos += missiles[i].dy) < 4) {
+        missiles[i].xpos = 0xff; // hide offscreen
+        missiles[i].ypos = 0;
+      }
+    }
+  }
+  // copy all "shadow missiles" to video memory
+  memcpy(vmissiles, missiles, sizeof(missiles));
+}
+
+void blowup_at(byte x, byte y) {
+  vsprites[6].color = 1;  
+  vsprites[6].code = 28;  
+  vsprites[6].xpos = x;  
+  vsprites[6].ypos = y; 
+  enemy_exploding = 1;
+} 
+
+void animate_enemy_explosion() {
+  if (enemy_exploding) {
+    // animate next frame
+    vsprites[6].code = 28 + enemy_exploding++;
+    if (enemy_exploding > 4) 
+      enemy_exploding = 0; // hide explosion after 4 frames
+  }
+}
+
+void animate_player_explosion() {
+  byte z = player_exploding;
+  if (z <= 5) {
+    if (z == 5) {
+      // erase explosion
+      memset_safe(&vram[29][28], BLANK, 4);
+      memset_safe(&vram[30][28], BLANK, 4);
+      memset_safe(&vram[31][28], BLANK, 4);
+      memset_safe(&vram[0][28], BLANK, 4);
+    } else {
+      // draw explosion
+      z = 0xb0 + (z<<4);
+      vcolumns[28].scroll = player_x;
+      vcolumns[31].scroll = player_x;
+      vcolumns[28].attrib = 2;
+      vcolumns[29].attrib = 2;
+      vcolumns[30].attrib = 2;
+      vcolumns[31].attrib = 2;
+      vram[29][28] = z+0x0;
+      vram[29][29] = z+0x1;
+      vram[29][30] = z+0x4;
+      vram[29][31] = z+0x5;
+      vram[30][28] = z+0x2;
+      vram[30][29] = z+0x3;
+      vram[30][30] = z+0x6;
+      vram[30][31] = z+0x7;
+      vram[31][28] = z+0x8;
+      vram[31][29] = z+0x9;
+      vram[31][30] = z+0xc;
+      vram[31][31] = z+0xd;
+      vram[0][28] = z+0xa;
+      vram[0][29] = z+0xb;
+      vram[0][30] = z+0xe;
+      vram[0][31] = z+0xf;
+    }
+  }
+}
+
+void hide_player_missile() {
+  missiles[7].ypos = 0;
+  missiles[7].xpos = 0xff;
+}
+
+void does_player_shoot_formation() {
+  byte mx = missiles[7].xpos;
+  byte my = 255 - missiles[7].ypos; // missiles are Y-backwards
+  signed char row = (my - FORMATION_Y0) / FORMATION_YSPACE
+  if (row >= 0 && row < ENEMY_ROWS) {
+    // ok if unsigned (in fact, must be due to range) 
+    byte xoffset = mx - FORMATION_X0 - formation_offset_x;
+    byte column = xoffset / FORMATION_XSPACE;
+    byte localx = xoffset - column * FORMATION_XSPACE;
+    if (column < ENEMIES_PER_ROW && localx < 16) {
+      char index = column + row * ENEMIES_PER_ROW;
+      if (formation[index].shape) {
+        formation[index].shape = 0;
+        enemies_left--;
+        blowup_at(get_attacker_x(index), get_attacker_y(index));
+	hide_player_missile();
+ 	add_score(2);
+      }
+    }
+  }
+}
+
 void does_player_shoot_attacker() {
   byte mx = missiles[7].xpos;
   byte my = 255 - missiles[7].ypos; // missiles are Y-backwards
